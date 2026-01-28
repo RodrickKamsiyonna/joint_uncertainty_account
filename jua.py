@@ -248,7 +248,7 @@ class GenericSSLModel(nn.Module):
             preds = torch.cat([pred_velocity_21, pred_velocity_12], dim=0)
             truths = torch.cat([true_velocity_21, true_velocity_12], dim=0)
             
-            return F.mse_loss(preds, truths)
+            return F.mse_loss(preds, truths, reduction="none").sum(dim=1).mean()
 
 # =============================================================================
 # 4. Evaluation
@@ -384,8 +384,6 @@ def main():
             
             optimizer.zero_grad()
             loss = model(views)
-            
-            if isinstance(loss, torch.Tensor) and loss.ndim > 0: loss = loss.mean()
             
             loss.backward()
             optimizer.step()

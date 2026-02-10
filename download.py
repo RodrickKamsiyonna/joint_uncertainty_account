@@ -17,6 +17,7 @@ Output structure (ImageFolder-compatible):
 """
 
 import os
+import gc
 import sys
 import shutil
 import pickle
@@ -152,73 +153,119 @@ def download_imagenette160(root: str, **kwargs):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ImageNet-100 — Source 1: HuggingFace  (no login, ~5 GB)
+# ImageNet-100 — Source 1: HuggingFace streaming  (no login, low RAM)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _imagenet100_from_huggingface(root: str):
     """
-    Downloads clane9/imagenet-100 from HuggingFace Hub.
+    Streams clane9/imagenet-100 from HuggingFace one sample at a time.
     - No account / token required
+    - Constant ~1-2 GB RAM regardless of dataset size (streaming=True)
     - 127k train + 5k val images, pre-resized to 160 px short side
-    - Saves as JPEG files in ImageFolder layout
     """
     ensure_pip("datasets", "Pillow")
     from datasets import load_dataset
 
     dataset_root = Path(root) / "imagenet100"
 
-    # Resume-safe: skip if already complete
-    if (dataset_root / "train").exists() and (dataset_root / "val").exists():
-        n_train = sum(1 for p in (dataset_root / "train").rglob("*") if p.is_file())
-        n_val   = sum(1 for p in (dataset_root / "val").rglob("*")   if p.is_file())
-        if n_train > 100_000 and n_val > 4_000:
-            print(f"  Already downloaded: {n_train:,} train, {n_val:,} val. Skipping.")
-            print(f"  --train_dir {dataset_root}/train  --val_dir {dataset_root}/val")
-            return
+    # ── Resume detection ──────────────────────────────────────────────────────
+    # Count existing files per split; skip if already looks complete
+    def count_files(p):
+        return sum(1 for f in p.rglob("*") if f.is_file()) if p.exists() else 0
 
-    print("  Loading clane9/imagenet-100 from HuggingFace ...")
-    print("  (No login needed. Expect ~5 GB download, may take 10–30 min.)")
+    n_train_existing = count_files(dataset_root / "train")
+    n_val_existing   = count_files(dataset_root / "val")
 
-    ds = load_dataset("clane9/imagenet-100", trust_remote_code=True)
+    splits_to_do = {}
+    if n_train_existing > 100_000:
+        print(f"  Train already complete ({n_train_existing:,} files). Skipping.")
+    else:
+        splits_to_do["train"] = ("train", n_train_existing)
 
-    # Build integer-label → safe folder name mapping
-    label_names = ds["train"].features["label"].names
+    if n_val_existing > 4_000:
+        print(f"  Val already complete ({n_val_existing:,} files). Skipping.")
+    else:
+        splits_to_do["validation"] = ("val", n_val_existing)
+
+    if not splits_to_do:
+        print(f"  --train_dir {dataset_root}/train  --val_dir {dataset_root}/val")
+        return
+
+    # ── Fetch label names once (tiny metadata call, not the images) ──────────
+    print("  Fetching label names from dataset metadata ...")
+    # Load only the info (no data) to get feature names
+    meta = load_dataset("clane9/imagenet-100", split="train", streaming=True)
+    label_names = meta.features["label"].names
 
     def safe_name(name):
-        # Use only the first descriptor before the comma, replace spaces/slashes
         return name.split(",")[0].strip().replace(" ", "_").replace("/", "_")[:40]
 
     id_to_folder = {i: safe_name(n) for i, n in enumerate(label_names)}
+    del meta
+    gc.collect()
 
-    split_map = {"train": "train", "validation": "val"}
+    # ── Stream and write each split ───────────────────────────────────────────
+    EXPECTED = {"train": 126_689, "validation": 5_000}   # approx totals
 
-    for hf_split, folder_split in split_map.items():
-        if hf_split not in ds:
-            print(f"  WARNING: split '{hf_split}' not in dataset, skipping.")
-            continue
-
-        split_ds   = ds[hf_split]
+    for hf_split, (folder_split, n_existing) in splits_to_do.items():
+        expected  = EXPECTED.get(hf_split, "?")
         split_path = dataset_root / folder_split
-        counters   = {}
 
-        print(f"  Writing {len(split_ds):,} {folder_split} images ...")
-        for idx, sample in enumerate(split_ds):
+        print(f"\n  Streaming {hf_split} split ({expected:,} images expected) ...")
+        print(f"  RAM stays low — images written to disk one-by-one.")
+
+        # streaming=True: HuggingFace yields one sample at a time, never
+        # materialises the full dataset in RAM.
+        stream = load_dataset(
+            "clane9/imagenet-100",
+            split=hf_split,
+            streaming=True,
+            trust_remote_code=True,
+        )
+
+        counters  = {}   # label_int → count of saved files for that class
+        skipped   = 0    # files we already have from a previous run
+        idx       = 0
+
+        for sample in stream:
             label     = sample["label"]
             class_dir = split_path / id_to_folder[label]
             class_dir.mkdir(parents=True, exist_ok=True)
 
+            i    = counters.get(label, 0)
+            dest = class_dir / f"{i:06d}.jpg"
+
+            # Skip files that already exist (resume support)
+            if dest.exists():
+                counters[label] = i + 1
+                skipped += 1
+                idx     += 1
+                continue
+
             img = sample["image"]
             if img.mode != "RGB":
                 img = img.convert("RGB")
+            img.save(dest, quality=92)
 
-            i = counters.get(label, 0)
-            img.save(class_dir / f"{i:06d}.jpg", quality=92)
+            # Free the PIL image immediately — don't let them accumulate
+            del img
+            sample.clear()
+
             counters[label] = i + 1
+            idx += 1
 
-            if (idx + 1) % 10_000 == 0:
-                print(f"    {idx + 1:,} / {len(split_ds):,} done ...")
+            if idx % 5_000 == 0:
+                saved = idx - skipped
+                print(f"    {idx:,} processed  ({saved:,} saved, {skipped:,} skipped) ...")
+                gc.collect()   # nudge Python to release any lingering buffers
 
-        print(f"  {folder_split}: {sum(counters.values()):,} images saved")
+        total_saved = sum(counters.values()) - skipped
+        print(f"  {folder_split}: {sum(counters.values()):,} total  "
+              f"({total_saved:,} newly saved, {skipped:,} already existed)")
+
+        # Force GC between splits
+        del stream, counters
+        gc.collect()
 
     print(f"\n  ImageNet-100 (HuggingFace) ready at: {dataset_root}")
     print(f"  --train_dir {dataset_root}/train  --val_dir {dataset_root}/val")
@@ -231,14 +278,10 @@ def _imagenet100_from_huggingface(root: str):
 def _imagenet100_from_kaggle(root: str, kaggle_username: str = None, kaggle_key: str = None):
     """
     Downloads ambityga/imagenet100 from Kaggle (~13 GB, full resolution).
-
-    Get your key at: https://www.kaggle.com/settings → API → Create New Token
-    Either pass --kaggle_username / --kaggle_key  OR  place kaggle.json at:
-        ~/.kaggle/kaggle.json
+    Get your key: https://www.kaggle.com/settings → API → Create New Token
     """
     ensure_pip("kaggle")
 
-    # Write credentials if supplied inline
     if kaggle_username and kaggle_key:
         import json
         kaggle_dir = Path.home() / ".kaggle"
@@ -252,7 +295,7 @@ def _imagenet100_from_kaggle(root: str, kaggle_username: str = None, kaggle_key:
         print("  Either:")
         print("    1. Pass  --kaggle_username YOU  --kaggle_key YOUR_KEY")
         print("    2. Place your kaggle.json at ~/.kaggle/kaggle.json")
-        print("  Get your key at: https://www.kaggle.com/settings → API → Create New Token\n")
+        print("  Get your key: https://www.kaggle.com/settings → API → Create New Token\n")
         sys.exit(1)
 
     dataset_root = Path(root) / "imagenet100"
@@ -262,12 +305,8 @@ def _imagenet100_from_kaggle(root: str, kaggle_username: str = None, kaggle_key:
     print("  Downloading ambityga/imagenet100 from Kaggle (~13 GB) ...")
     run(f"kaggle datasets download -d ambityga/imagenet100 -p {tmp} --unzip")
 
-    # The Kaggle dataset unpacks as:
-    #   train.X1/ train.X2/ train.X3/ train.X4/  ← four shards of train images
-    #   val.X/                                    ← validation images
-    # Each already has synset sub-dirs (n01440764/ etc.) → valid ImageFolder.
-    # We merge the four train shards into one train/ folder.
-
+    # Kaggle layout: train.X1/ train.X2/ train.X3/ train.X4/ + val.X/
+    # Each already has synset sub-dirs → merge into one train/ folder
     print("  Merging train shards ...")
     for shard in sorted(tmp.glob("train.X*")):
         for synset_dir in sorted(shard.iterdir()):
@@ -293,7 +332,7 @@ def _imagenet100_from_kaggle(root: str, kaggle_username: str = None, kaggle_key:
 
     n_train = sum(1 for p in (dataset_root / "train").rglob("*") if p.is_file())
     n_val   = sum(1 for p in (dataset_root / "val").rglob("*")   if p.is_file())
-    print(f"  train: {n_train:,} images  |  val: {n_val:,} images")
+    print(f"  train: {n_train:,}  |  val: {n_val:,}")
     print(f"\n  ImageNet-100 (Kaggle) ready at: {dataset_root}")
     print(f"  --train_dir {dataset_root}/train  --val_dir {dataset_root}/val")
 
@@ -323,18 +362,13 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--dataset", required=True, choices=list(DATASETS.keys()),
-                        help="Which dataset to download")
+    parser.add_argument("--dataset", required=True, choices=list(DATASETS.keys()))
     parser.add_argument("--root",    required=True,
                         help="Root directory where the dataset folder will be created")
-
-    # imagenet100-specific
-    parser.add_argument("--source", default="huggingface", choices=["huggingface", "kaggle"],
-                        help="Source for imagenet100 (default: huggingface — no login needed)")
-    parser.add_argument("--kaggle_username", default=None,
-                        help="Kaggle username (only needed with --source kaggle)")
-    parser.add_argument("--kaggle_key",      default=None,
-                        help="Kaggle API key  (only needed with --source kaggle)")
+    parser.add_argument("--source",  default="huggingface", choices=["huggingface", "kaggle"],
+                        help="Source for imagenet100 (default: huggingface — no login, low RAM)")
+    parser.add_argument("--kaggle_username", default=None)
+    parser.add_argument("--kaggle_key",      default=None)
     return parser.parse_args()
 
 
@@ -356,7 +390,6 @@ def main():
         kaggle_username=args.kaggle_username,
         kaggle_key=args.kaggle_key,
     )
-
     print(f"\n✓ Done.\n")
 
 

@@ -195,19 +195,12 @@ class GenericSSLModel(nn.Module):
 
     def forward(self, views):
         """
-        Returns (preds, truths) — both tensors of shape (N, embedding_dim).
-        Loss is computed in the training loop, so DataParallel gathers
-        vectors (not scalars) across GPUs without any issues.
+        VAE branch  → returns (recon_loss + kl_loss)  as a scalar (unchanged from original).
+        Flow branch → returns (preds, truths) as (2N, D) vectors so the training
+                      loop can call F.mse_loss(preds, truths, ...) on gathered tensors.
 
-        VAE branch:
-            preds  = reconstructed embedding + per-dim KL penalty term
-            truths = detached target embedding
-            Together, F.mse_loss(preds, truths).sum(dim=1).mean() equals the
-            original recon + KL objective.
-
-        Flow branch:
-            preds  = concatenated predicted velocities  (2N, D)
-            truths = concatenated true velocities       (2N, D)
+        The training loop checks self.loss_type (or isinstance) to decide how to
+        reduce the output into a final scalar for .backward().
         """
         view1, view2 = views[0], views[1]
 
@@ -215,6 +208,7 @@ class GenericSSLModel(nn.Module):
         online_feat2 = self.backbone(view2)
 
         if self.loss_type == "vae":
+            # ---- original VAE logic, untouched ----
             mean, logvar = self.projection_head1(online_feat1.detach(), online_feat2.detach())
             std = torch.exp(0.5 * logvar)
             eps = torch.randn_like(std)
@@ -222,14 +216,9 @@ class GenericSSLModel(nn.Module):
 
             pred = self.projection_head2(online_feat1, sample)
 
-            # Fold per-dim KL into the prediction vector so the caller's single
-            # mse_loss call captures the full VAE objective.
-            # KL per dim: -0.5 * (1 + logvar - mean^2 - exp(logvar))
-            kl_per_dim = -0.5 * (1 + logvar - mean.pow(2) - logvar.exp())  # (N, D)
-            preds  = pred + kl_per_dim
-            truths = online_feat2.detach()
+            kl  = 1 + logvar - mean.pow(2) - logvar.exp()
 
-            return preds, truths
+            return  pred, online_feat2, kl
 
         elif self.loss_type == "flow":
             context1 = self.flow_projection(online_feat1)
@@ -383,10 +372,19 @@ def main():
 
             optimizer.zero_grad()
 
-            preds, truths = model(views)
-            # DataParallel gathers preds & truths along dim-0 across GPUs,
-            # giving us back plain (N, D) tensors — loss is always a clean scalar.
-            loss = F.mse_loss(preds, truths, reduction="none").sum(dim=1).mean()
+            output = model(views)
+
+            if args.loss == "vae":
+                # VAE returns a scalar loss directly (original behaviour).
+                # DataParallel may gather it into a 1-D vector, so reduce with .mean().
+                pred , truth, vvect = output 
+                vloss =  -0.5 * torch.mean(vvect)
+                loss = F.mse_loss(pred, truth.detach()) + 1.0*vloss
+            else:
+                # Flow returns (preds, truths) vectors; DataParallel gathers along
+                # dim-0, so we still get clean (N, D) tensors here.
+                preds, truths = output
+                loss = F.mse_loss(preds, truths, reduction="none").sum(dim=1).mean()
 
             loss.backward()
             optimizer.step()

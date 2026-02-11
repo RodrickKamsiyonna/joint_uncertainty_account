@@ -86,7 +86,7 @@ def get_transforms(img_size):
     ])
 
     test_transform = T.Compose([
-        T.Resize(img_size), # Ensure size consistency
+        T.Resize(img_size),
         T.CenterCrop(img_size),
         T.ToTensor(),
         T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
@@ -114,7 +114,6 @@ class ResNetEncoder(nn.Module):
         super().__init__()
         base_model = resnet18(weights=None)
         
-        # Modify conv1 for small images if requested
         if small_conv:
             base_model.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
             base_model.maxpool = nn.Identity()
@@ -178,14 +177,10 @@ class GenericSSLModel(nn.Module):
         self.embedding_dim = embedding_dim
         self.loss_type = loss_type
         
-        # Backbone
         self.backbone = ResNetEncoder(small_conv=small_conv)
-        
-        # Shared Heads
         self.projection_head2 = NonLinearPredictionHead2(output_dim=embedding_dim)
         self.projection_head1 = NonLinearPredictionHead1(output_dim=embedding_dim)
         
-        # Flow Matching Components
         time_emb_dim = 128
         self.time_embedding = SinusoidalTimeEmbedding(dim=time_emb_dim)
         self.velocity_predictor = VelocityPredictor(
@@ -194,41 +189,55 @@ class GenericSSLModel(nn.Module):
             output_dim=embedding_dim,
             time_emb_dim=time_emb_dim,
         )
-        # For flow matching projection (if needed strictly as separate head)
         self.flow_projection = nn.Sequential(
              nn.Linear(512, 1024), nn.BatchNorm1d(1024), nn.ReLU(), nn.Linear(1024, embedding_dim)
         )
 
     def forward(self, views):
+        """
+        Returns (preds, truths) — both tensors of shape (N, embedding_dim).
+        Loss is computed in the training loop, so DataParallel gathers
+        vectors (not scalars) across GPUs without any issues.
+
+        VAE branch:
+            preds  = reconstructed embedding + per-dim KL penalty term
+            truths = detached target embedding
+            Together, F.mse_loss(preds, truths).sum(dim=1).mean() equals the
+            original recon + KL objective.
+
+        Flow branch:
+            preds  = concatenated predicted velocities  (2N, D)
+            truths = concatenated true velocities       (2N, D)
+        """
         view1, view2 = views[0], views[1]
-        
-        # Get Features
+
         online_feat1 = self.backbone(view1)
         online_feat2 = self.backbone(view2)
 
         if self.loss_type == "vae":
-            # --- VAE Style Loss ---
             mean, logvar = self.projection_head1(online_feat1.detach(), online_feat2.detach())
             std = torch.exp(0.5 * logvar)
             eps = torch.randn_like(std)
             sample = mean + eps * std
-            
+
             pred = self.projection_head2(online_feat1, sample)
-            
-            recon_loss = F.mse_loss(pred, online_feat2.detach())
-            kl_loss = -0.5 * torch.mean(1 + logvar - mean.pow(2) - logvar.exp())
-            
-            return recon_loss + 1.0 * kl_loss
+
+            # Fold per-dim KL into the prediction vector so the caller's single
+            # mse_loss call captures the full VAE objective.
+            # KL per dim: -0.5 * (1 + logvar - mean^2 - exp(logvar))
+            kl_per_dim = -0.5 * (1 + logvar - mean.pow(2) - logvar.exp())  # (N, D)
+            preds  = pred + kl_per_dim
+            truths = online_feat2.detach()
+
+            return preds, truths
 
         elif self.loss_type == "flow":
-            # --- Flow Matching Loss ---
-            # Project features for context
             context1 = self.flow_projection(online_feat1)
             context2 = self.flow_projection(online_feat2)
-            
-            target1 = online_feat1.detach() 
+
+            target1 = online_feat1.detach()
             target2 = online_feat2.detach()
-            
+
             # View 1 -> View 2
             y_0 = torch.randn_like(target2)
             t = torch.rand(target2.shape[0], 1, device=target2.device)
@@ -236,7 +245,7 @@ class GenericSSLModel(nn.Module):
             true_velocity_12 = target2 - y_0
             t_emb = self.time_embedding(t)
             pred_velocity_12 = self.velocity_predictor(y_t, context1, t_emb)
-            
+
             # View 2 -> View 1
             y_0_b = torch.randn_like(target1)
             t_b = torch.rand(target1.shape[0], 1, device=target1.device)
@@ -244,11 +253,11 @@ class GenericSSLModel(nn.Module):
             true_velocity_21 = target1 - y_0_b
             t_emb_b = self.time_embedding(t_b)
             pred_velocity_21 = self.velocity_predictor(y_t_b, context2, t_emb_b)
-            
-            preds = torch.cat([pred_velocity_21, pred_velocity_12], dim=0)
-            truths = torch.cat([true_velocity_21, true_velocity_12], dim=0)
-            
-            return F.mse_loss(preds, truths, reduction="none").sum(dim=1).mean()
+
+            preds  = torch.cat([pred_velocity_21, pred_velocity_12], dim=0)  # (2N, D)
+            truths = torch.cat([true_velocity_21, true_velocity_12], dim=0)  # (2N, D)
+
+            return preds, truths
 
 # =============================================================================
 # 4. Evaluation
@@ -258,7 +267,6 @@ def evaluate_model(model, train_loader, test_loader, device, args, num_classes):
     was_training = model.training
     model.eval()
     
-    # Handle DataParallel unwrapping
     backbone = model.module.backbone if isinstance(model, nn.DataParallel) else model.backbone
 
     def extract_features(loader, desc):
@@ -272,27 +280,25 @@ def evaluate_model(model, train_loader, test_loader, device, args, num_classes):
         return torch.cat(feats, dim=0), torch.cat(labels, dim=0)
 
     train_feats, train_labels = extract_features(train_loader, "Extract Train Features")
-    test_feats, test_labels = extract_features(test_loader, "Extract Test Features")
+    test_feats, test_labels   = extract_features(test_loader,  "Extract Test Features")
 
     # k-NN
     print("Running k-NN...")
     knn_train = F.normalize(train_feats, dim=1).numpy()
-    knn_test = F.normalize(test_feats, dim=1).numpy()
+    knn_test  = F.normalize(test_feats,  dim=1).numpy()
     knn = KNeighborsClassifier(n_neighbors=args.knn_k, n_jobs=-1)
     knn.fit(knn_train, train_labels.numpy())
     knn_acc = knn.score(knn_test, test_labels.numpy()) * 100.0
     print(f"--- k-NN Accuracy: {knn_acc:.2f}% ---")
     if wandb.run: wandb.log({"eval/knn_accuracy": knn_acc})
 
-    # Linear Probe (Simplified)
+    # Linear Probe
     print("Training Linear Probe...")
-    # NOTE: Normalization removed here as requested for large datasets
-    
     probe = nn.Linear(train_feats.shape[1], num_classes).to(device)
     opt_probe = optim.AdamW(probe.parameters(), lr=5e-3)
     crit = nn.CrossEntropyLoss()
     
-    probe_ds = TensorDataset(train_feats.to(device), train_labels.to(device))
+    probe_ds     = TensorDataset(train_feats.to(device), train_labels.to(device))
     probe_loader = DataLoader(probe_ds, batch_size=args.batch_size, shuffle=True)
     
     for _ in range(args.linear_probe_epochs):
@@ -302,11 +308,10 @@ def evaluate_model(model, train_loader, test_loader, device, args, num_classes):
             loss.backward()
             opt_probe.step()
             
-    # Probe Eval
     with torch.no_grad():
         logits = probe(test_feats.to(device))
-        preds = logits.argmax(dim=1)
-        acc = (preds.cpu() == test_labels).float().mean().item() * 100.0
+        preds  = logits.argmax(dim=1)
+        acc    = (preds.cpu() == test_labels).float().mean().item() * 100.0
         
     print(f"--- Linear Probe Accuracy: {acc:.2f}% ---")
     if wandb.run: wandb.log({"eval/linear_probe_accuracy": acc})
@@ -326,31 +331,27 @@ def main():
         wandb.login(key=args.wandb_key)
     wandb.init(project=args.project_name, config=vars(args))
 
-    # Datasets
     ssl_aug, test_aug = get_transforms(args.img_size)
     
     print(f"Loading Training Data from: {args.train_dir}")
     train_ds = ImageFolder(args.train_dir, transform=MultiViewTransform(ssl_aug, num_views=2))
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, 
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                               num_workers=args.num_workers, pin_memory=True, drop_last=True)
 
-    # Eval Data
     eval_dir = args.val_dir if args.val_dir else args.train_dir
     print(f"Loading Eval Data from: {eval_dir}")
     
-    # We need a standard (non-multiview) dataset for feature extraction
     train_eval_ds = ImageFolder(args.train_dir, transform=test_aug)
-    test_eval_ds = ImageFolder(eval_dir, transform=test_aug)
+    test_eval_ds  = ImageFolder(eval_dir,       transform=test_aug)
     
     train_eval_loader = DataLoader(train_eval_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
-    test_eval_loader = DataLoader(test_eval_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    test_eval_loader  = DataLoader(test_eval_ds,  batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
     
     num_classes = len(train_ds.classes)
     print(f"Detected {num_classes} classes.")
 
-    # Model Setup
     model = GenericSSLModel(
-        embedding_dim=args.embedding_dim, 
+        embedding_dim=args.embedding_dim,
         loss_type=args.loss,
         small_conv=args.small_conv
     ).to(device)
@@ -359,11 +360,10 @@ def main():
         model = nn.DataParallel(model)
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    
-    # Scheduler
-    total_epochs = args.epochs
+
+    total_epochs  = args.epochs
     warmup_epochs = 10
-    
+
     def lr_lambda(epoch):
         if epoch < warmup_epochs:
             return float(epoch + 1) / float(max(1, warmup_epochs))
@@ -372,22 +372,25 @@ def main():
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
-    # Loop
     print("--- Starting Training ---")
     for epoch in range(1, args.epochs + 1):
         model.train()
         total_loss = 0.0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}")
-        
+
         for views, _ in pbar:
             views = [v.to(device) for v in views]
-            
+
             optimizer.zero_grad()
-            loss = model(views)
-            
+
+            preds, truths = model(views)
+            # DataParallel gathers preds & truths along dim-0 across GPUs,
+            # giving us back plain (N, D) tensors — loss is always a clean scalar.
+            loss = F.mse_loss(preds, truths, reduction="none").sum(dim=1).mean()
+
             loss.backward()
             optimizer.step()
-            
+
             total_loss += loss.item()
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
             wandb.log({"train/step_loss": loss.item()})
@@ -395,7 +398,7 @@ def main():
         avg_loss = total_loss / len(train_loader)
         print(f"Epoch {epoch} Avg Loss: {avg_loss:.4f}")
         wandb.log({"train/epoch_loss": avg_loss, "epoch": epoch, "lr": scheduler.get_last_lr()[0]})
-        
+
         scheduler.step()
 
         if epoch % args.eval_every == 0 or epoch == args.epochs:

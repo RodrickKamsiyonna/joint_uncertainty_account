@@ -384,7 +384,7 @@ def main():
                 # Flow returns (preds, truths) vectors; DataParallel gathers along
                 # dim-0, so we still get clean (N, D) tensors here.
                 preds, truths = output
-                loss = F.mse_loss(preds, truths, reduction="none").sum(dim=1).mean()
+                loss = F.mse_loss(preds, truths)
 
             loss.backward()
             optimizer.step()

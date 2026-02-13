@@ -74,16 +74,22 @@ class MultiViewTransform:
         return [self.transform(x) for _ in range(self.num_views)]
 
 def get_transforms(img_size):
+    # Calculate odd kernel size
+    kernel_size = max(3, img_size // 20)
+    if kernel_size % 2 == 0:  # Make it odd
+        kernel_size += 1
+    
     ssl_transform = T.Compose([
         T.RandomResizedCrop(size=img_size, scale=(0.2, 1.0)),
         T.RandomHorizontalFlip(0.5),
         T.RandomApply([T.ColorJitter(0.4, 0.4, 0.2, 0.1)], p=0.8),
         T.RandomGrayscale(p=0.2),
-        T.RandomApply([T.GaussianBlur(kernel_size=max(3, img_size//20))], p=0.5),
+        T.RandomApply([T.GaussianBlur(kernel_size=kernel_size)], p=0.5),
         T.RandomSolarize(threshold=128, p=0.2),
         T.ToTensor(),
         T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
     ])
+    return ssl_transform
 
     test_transform = T.Compose([
         T.Resize(img_size),

@@ -89,8 +89,6 @@ def get_transforms(img_size):
         T.ToTensor(),
         T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
     ])
-    return ssl_transform
-
     test_transform = T.Compose([
         T.Resize(img_size),
         T.CenterCrop(img_size),
